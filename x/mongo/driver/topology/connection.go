@@ -9,6 +9,7 @@ package topology
 import (
 	"context"
 	"crypto/tls"
+	"encoding/asn1"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 	"go.mongodb.org/mongo-driver/x/mongo/driver/address"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
+	"golang.org/x/crypto/ocsp"
 )
 
 var globalConnectionID uint64 = 1
@@ -510,8 +512,101 @@ func configureTLS(ctx context.Context, nc net.Conn, addr address.Address, config
 		if err != nil {
 			return nil, err
 		}
+
+		if ocspErr := verifyOCSP(client.ConnectionState()); ocspErr != nil {
+			return nil, ocspErr
+		}
 	case <-ctx.Done():
 		return nil, errors.New("server connection cancelled/timeout during TLS handshake")
 	}
 	return client, nil
 }
+
+var (
+	ocspExtensionID = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 24}
+)
+
+func verifyOCSP(connState tls.ConnectionState) error {
+	if numCerts := len(connState.PeerCertificates); numCerts < 2 {
+		return fmt.Errorf("certificate chain contained too few certificates: %d (at least 2 expected)", numCerts)
+	}
+
+	serverCert := connState.PeerCertificates[0]
+	caCert := connState.PeerCertificates[1]
+
+	var mustStaple bool // true if the server certificate has the must staple extension
+	for _, extension := range serverCert.Extensions {
+		if extension.Id.Equal(ocspExtensionID) {
+			mustStaple = true
+			break
+		}
+	}
+
+	// If the server has a Must-Staple certificate and the server does not present a stapled OCSP response, error.
+	if mustStaple && len(connState.OCSPResponse) == 0 {
+		return errors.New("server provided a certificate with the Must-Staple extension but did not provide a stapled OCSP response")
+	}
+
+	// The server presented a stapled OCSP response.
+	if len(connState.OCSPResponse) > 0 {
+		// If the server staples an OCSP response that does not cover the certificate it presents, error.
+		parsedResponse, err := ocsp.ParseResponseForCert(connState.OCSPResponse, serverCert, caCert)
+		if err != nil {
+			return fmt.Errorf("server returned invalid OCSP staple data: %v", err)
+		}
+		if err = parsedResponse.CheckSignatureFrom(caCert); err != nil {
+			return fmt.Errorf("server returned OCSP staple with invalid signature: %v", err)
+		}
+		if parsedResponse.Status != ocsp.Good {
+			return errors.New("server returned OCSP staple indiciating that the certificate has been revoked")
+		}
+
+		// If the server staples an OCSP response that covers the certificate it presents, accept the stapled OCSP
+		// response and validate all of the certificates that are presented in the response.
+		// TODO: presenting multiple certs in an OCSP staple is not possible right now because of openssl limitations.
+		// Do we have to do anything here?
+		return nil
+	}
+
+	// TODO: no stapled repsonse
+	return nil
+}
+
+// func verifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+// 	// Per documentation for the tls.Config.VerifyPeerCertificate field (https://golang.org/pkg/crypto/tls/#Config),
+// 	// the verifiedChains argument will be nil if InsecureSkipVerify is set, so we return without doing any
+// 	// additional checking.
+// 	if verifiedChains == nil {
+// 		return nil
+// 	}
+
+// 	return nil
+// }
+
+// func verifyOCSP(connState tls.ConnectionState) error {
+// if len(connState.OCSPResponse) == 0 {
+// 	return nil
+// }
+
+// for _, chain := range connState.VerifiedChains {
+// 	if n := len(chain); n < 2 {
+// 		return fmt.Errorf("verified chain contained too few certificates: %d", n)
+// 	}
+
+// 	serverCert := chain[0]
+// 	caCert := chain[1]
+
+// 	resp, err := ocsp.ParseResponseForCert(connState.OCSPResponse, serverCert, caCert)
+// 	if err != nil {
+// 		return fmt.Errorf("invalid ocsp staple data: %v", err)
+// 	}
+// 	if err := resp.CheckSignatureFrom(caCert); err != nil {
+// 		return fmt.Errorf("invalid ocsp signature: %v", err)
+// 	}
+// 	if resp.Status != ocsp.Good {
+// 		return fmt.Errorf("certificate revoked /cn=%s", serverCert.Subject.CommonName)
+// 	}
+// }
+
+// return nil
+// }
