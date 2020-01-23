@@ -7,13 +7,17 @@
 package topology
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/asn1"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -527,12 +531,18 @@ var (
 )
 
 func verifyOCSP(connState tls.ConnectionState) error {
-	if numCerts := len(connState.PeerCertificates); numCerts < 2 {
+	if len(connState.VerifiedChains) == 0 {
+		return fmt.Errorf("no verified certificate chains reported after TLS handshake")
+	}
+
+	certChain := connState.VerifiedChains[0]
+	if numCerts := len(certChain); numCerts < 2 {
+		// TODO: maybe return nil here
 		return fmt.Errorf("certificate chain contained too few certificates: %d (at least 2 expected)", numCerts)
 	}
 
-	serverCert := connState.PeerCertificates[0]
-	caCert := connState.PeerCertificates[1]
+	serverCert := certChain[0]
+	caCert := certChain[1]
 
 	var mustStaple bool // true if the server certificate has the must staple extension
 	for _, extension := range serverCert.Extensions {
@@ -549,26 +559,91 @@ func verifyOCSP(connState tls.ConnectionState) error {
 
 	// The server presented a stapled OCSP response.
 	if len(connState.OCSPResponse) > 0 {
-		// If the server staples an OCSP response that does not cover the certificate it presents, error.
-		parsedResponse, err := ocsp.ParseResponseForCert(connState.OCSPResponse, serverCert, caCert)
-		if err != nil {
-			return fmt.Errorf("server returned invalid OCSP staple data: %v", err)
+		if err := verifyOCSPResponse(serverCert, caCert, connState.OCSPResponse); err != nil {
+			return fmt.Errorf("error verifying stapled OCSP response: %v", err)
 		}
-		if err = parsedResponse.CheckSignatureFrom(caCert); err != nil {
-			return fmt.Errorf("server returned OCSP staple with invalid signature: %v", err)
-		}
-		if parsedResponse.Status != ocsp.Good {
-			return errors.New("server returned OCSP staple indiciating that the certificate has been revoked")
-		}
+		return nil
 
-		// If the server staples an OCSP response that covers the certificate it presents, accept the stapled OCSP
-		// response and validate all of the certificates that are presented in the response.
-		// TODO: presenting multiple certs in an OCSP staple is not possible right now because of openssl limitations.
-		// Do we have to do anything here?
+		// // If the server staples an OCSP response that does not cover the certificate it presents, error.
+		// parsedResponse, err := ocsp.ParseResponseForCert(connState.OCSPResponse, serverCert, caCert)
+		// if err != nil {
+		// 	return fmt.Errorf("server returned invalid OCSP staple data: %v", err)
+		// }
+		// // TODO: not sure if this is necessary
+		// if err = parsedResponse.CheckSignatureFrom(caCert); err != nil {
+		// 	return fmt.Errorf("server returned OCSP staple with invalid signature: %v", err)
+		// }
+		// if parsedResponse.Status != ocsp.Good {
+		// 	return errors.New("server returned OCSP staple indiciating that the certificate has been revoked")
+		// }
+
+		// // If the server staples an OCSP response that covers the certificate it presents, accept the stapled OCSP
+		// // response and validate all of the certificates that are presented in the response.
+		// // TODO: presenting multiple certs in an OCSP staple is not possible right now because of openssl limitations.
+		// // Do we have to do anything here?
+		// return nil
+	}
+
+	// TODO: figure out status of OCSP/CRL cache access (steps 4-6 in the OCSP spec)
+
+	if len(serverCert.OCSPServer) == 0 {
 		return nil
 	}
 
-	// TODO: no stapled repsonse
+	// If the server’s certificate remains unvalidated and that certificate has an OCSP endpoint, the driver SHOULD
+	// reach out to the OCSP endpoint specified and attempt to validate that certificate.
+	// TODO: spec only mentions single OCSP endpoint, but x509.Certificate.OCSPServer is []string
+	for _, ocspEndpoint := range serverCert.OCSPServer {
+		ocspRequest, err := ocsp.CreateRequest(serverCert, caCert, nil)
+		if err != nil {
+			return fmt.Errorf("error creating OCSP request: %v", err)
+		}
+
+		// TODO: always POST?
+		httpResponse, err := http.Post(ocspEndpoint, "application/ocsp-request", bytes.NewBuffer(ocspRequest))
+		if err != nil {
+			// TODO: this just means we couldn't contact the responder. should probably soft fail and continue without
+			// propagating error
+			return fmt.Errorf("error contacting OCSP responder: %v", err)
+		}
+		defer func() {
+			_ = httpResponse.Body.Close()
+		}()
+
+		ocspResponse, err := ioutil.ReadAll(httpResponse.Body)
+		if err != nil {
+			return fmt.Errorf("error reading response from OCSP responder: %v", err)
+		}
+		_ = ocspResponse
+		if err = verifyOCSPResponse(serverCert, caCert, ocspResponse); err != nil {
+			return fmt.Errorf("error verifying respose from OCSP responder: %v", err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func verifyOCSPResponse(serverCert, caCert *x509.Certificate, ocspResponse []byte) error {
+	// If the server staples an OCSP response that does not cover the certificate it presents, error.
+	parsedResponse, err := ocsp.ParseResponseForCert(ocspResponse, serverCert, caCert)
+	if err != nil {
+		return fmt.Errorf("server returned invalid OCSP staple data: %v", err)
+	}
+	// TODO: not sure if this is necessary
+	if caCert != nil {
+		if err = parsedResponse.CheckSignatureFrom(caCert); err != nil {
+			return fmt.Errorf("server returned OCSP staple with invalid signature: %v", err)
+		}
+	}
+	if parsedResponse.Status != ocsp.Good {
+		return errors.New("server returned OCSP staple indiciating that the certificate has been revoked")
+	}
+
+	// If the server staples an OCSP response that covers the certificate it presents, accept the stapled OCSP
+	// response and validate all of the certificates that are presented in the response.
+	// TODO: presenting multiple certs in an OCSP staple is not possible right now because of openssl limitations.
+	// Do we have to do anything here?
 	return nil
 }
 
